@@ -7,6 +7,57 @@ page. It is not a recursive crawler.
 # ChangeLog
 # ---------
 #
+# 2.11  The Scholar site seems to have become more picky about the
+#       number of results requested. The default of 20 in scholar.py
+#       could cause HTTP 503 responses. scholar.py now doesn't request
+#       a maximum unless you provide it at the comment line. (For the
+#       time being, you still cannot request more than 20 results.)
+#
+# 2.10  Merged a fix for the "TypError: quote_from_bytes()" problem on
+#       Python 3.x from hinnefe2.
+#
+# 2.9   Fixed Unicode problem in certain queries. Thanks to smidm for
+#       this contribution.
+#
+# 2.8   Improved quotation-mark handling for multi-word phrases in
+#       queries. Also, log URLs %-decoded in debugging output, for
+#       easier interpretation.
+#
+# 2.7   Ability to extract content excerpts as reported in search results.
+#       Also a fix to -s|--some and -n|--none: these did not yet support
+#       passing lists of phrases. This now works correctly if you provide
+#       separate phrases via commas.
+#
+# 2.6   Ability to disable inclusion of patents and citations. This
+#       has the same effect as unchecking the two patents/citations
+#       checkboxes in the Scholar UI, which are checked by default.
+#       Accordingly, the command-line options are --no-patents and
+#       --no-citations.
+#
+# 2.5:  Ability to parse global result attributes. This right now means
+#       only the total number of results as reported by Scholar at the
+#       top of the results pages (e.g. "About 31 results"). Such
+#       global result attributes end up in the new attrs member of the
+#       used ScholarQuery class. To render those attributes, you need
+#       to use the new --txt-globals flag.
+#
+#       Rendering global results is currently not supported for CSV
+#       (as they don't fit the one-line-per-article pattern). For
+#       grepping, you can separate the global results from the
+#       per-article ones by looking for a line prefix of "[G]":
+#
+#       $ scholar.py --txt-globals -a "Einstein"
+#       [G]    Results 11900
+#
+#                Title Can quantum-mechanical description of physical reality be considered complete?
+#                  URL http://journals.aps.org/pr/abstract/10.1103/PhysRev.47.777
+#                 Year 1935
+#            Citations 12804
+#             Versions 80
+#              Cluster ID 8174092782678430881
+#       Citations list http://scholar.google.com/scholar?cites=8174092782678430881&as_sdt=2005&sciodt=0,5&hl=en
+#        Versions list http://scholar.google.com/scholar?cluster=8174092782678430881&hl=en&as_sdt=0,5
+#
 # 2.4:  Bugfixes:
 #
 #       - Correctly handle Unicode characters when reporting results
@@ -84,7 +135,7 @@ page. It is not a recursive crawler.
 #
 # Don't complain about missing docstrings: pylint: disable-msg=C0111
 #
-# Copyright 2010--2014 Christian Kreibich. All rights reserved.
+# Copyright 2010--2017 Christian Kreibich. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are
@@ -112,20 +163,21 @@ page. It is not a recursive crawler.
 
 import optparse
 import os
-import sys
 import re
+import sys
+import warnings
 
 try:
     # Try importing for Python 3
     # pylint: disable-msg=F0401
     # pylint: disable-msg=E0611
     from urllib.request import HTTPCookieProcessor, Request, build_opener
-    from urllib.parse import quote
+    from urllib.parse import quote, unquote
     from http.cookiejar import MozillaCookieJar
 except ImportError:
     # Fallback for Python 2
     from urllib2 import Request, build_opener, HTTPCookieProcessor
-    from urllib import quote
+    from urllib import quote, unquote
     from cookielib import MozillaCookieJar
 
 # Import BeautifulSoup -- try 4 first, fall back to older
@@ -141,9 +193,13 @@ except ImportError:
 # Support unicode in both Python 2 and 3. In Python 3, unicode is str.
 if sys.version_info[0] == 3:
     unicode = str # pylint: disable-msg=W0622
-    encode = lambda s: s # pylint: disable-msg=C0103
+    encode = lambda s: unicode(s) # pylint: disable-msg=C0103
 else:
-    encode = lambda s: s.encode('utf-8') # pylint: disable-msg=C0103
+    def encode(s):
+        if isinstance(s, basestring):
+            return s.encode('utf-8') # pylint: disable-msg=C0103
+        else:
+            return str(s)
 
 
 class Error(Exception):
@@ -158,12 +214,33 @@ class QueryArgumentError(Error):
     """A query did not have a suitable set of arguments."""
 
 
+class SoupKitchen(object):
+    """Factory for creating BeautifulSoup instances."""
+
+    @staticmethod
+    def make_soup(markup, parser=None):
+        """Factory method returning a BeautifulSoup instance. The created
+        instance will use a parser of the given name, if supported by
+        the underlying BeautifulSoup instance.
+        """
+        if 'bs4' in sys.modules:
+            # We support parser specification. If the caller didn't
+            # specify one, leave it to BeautifulSoup to pick the most
+            # suitable one, but suppress the user warning that asks to
+            # select the most suitable parser ... which BS then
+            # selects anyway.
+            if parser is None:
+                warnings.filterwarnings('ignore', 'No parser was explicitly specified')
+            return BeautifulSoup(markup, parser)
+
+        return BeautifulSoup(markup)
+
 class ScholarConf(object):
     """Helper class for global settings."""
 
-    VERSION = '2.4'
+    VERSION = '2.10'
     LOG_LEVEL = 1
-    MAX_PAGE_RESULTS = 20 # Current maximum for per-page results
+    MAX_PAGE_RESULTS = 10 # Current default for per-page results
     SCHOLAR_SITE = 'http://scholar.google.com'
 
     # USER_AGENT = 'Mozilla/5.0 (X11; U; FreeBSD i386; en-US; rv:1.9.2.9) Gecko/20100913 Firefox/3.6.9'
@@ -205,6 +282,9 @@ class ScholarArticle(object):
     provides basic dictionary-like behavior.
     """
     def __init__(self):
+        # The triplets for each keyword correspond to (1) the actual
+        # value, (2) a user-suitable label for the item, and (3) an
+        # ordering index:
         self.attrs = {
             'title':         [None, 'Title',          0],
             'url':           [None, 'URL',            1],
@@ -216,6 +296,7 @@ class ScholarArticle(object):
             'url_citations': [None, 'Citations list', 7],
             'url_versions':  [None, 'Versions list',  8],
             'url_citation':  [None, 'Citation link',  9],
+            'excerpt':       [None, 'Excerpt',       10],
         }
 
         # The citation data in one of the standard export formats,
@@ -293,14 +374,26 @@ class ScholarArticleParser(object):
         successfully.  In this base class, the callback does nothing.
         """
 
+    def handle_num_results(self, num_results):
+        """
+        The parser invokes this callback if it determines the overall
+        number of results, as reported on the parsed results page. The
+        base class implementation does nothing.
+        """
+
     def parse(self, html):
         """
         This method initiates parsing of HTML content, cleans resulting
         content as needed, and notifies the parser instance of
         resulting instances via the handle_article callback.
         """
-        self.soup = BeautifulSoup(html)
-        for div in self.soup.findAll(ScholarArticleParser._tag_checker):
+        self.soup = SoupKitchen.make_soup(html)
+
+        # This parses any global, non-itemized attributes from the page.
+        self._parse_globals()
+
+        # Now parse out listed articles:
+        for div in self.soup.findAll(ScholarArticleParser._tag_results_checker):
             self._parse_article(div)
             self._clean_article()
             if self.article['title']:
@@ -314,6 +407,22 @@ class ScholarArticleParser(object):
         """
         if self.article['title']:
             self.article['title'] = self.article['title'].strip()
+
+    def _parse_globals(self):
+        tag = self.soup.find(name='div', attrs={'id': 'gs_ab_md'})
+        if tag is not None:
+            raw_text = tag.findAll(text=True)
+            # raw text is a list because the body contains <b> etc
+            if raw_text is not None and len(raw_text) > 0:
+                try:
+                    num_results = raw_text[0].split()[1]
+                    # num_results may now contain commas to separate
+                    # thousands, strip:
+                    num_results = num_results.replace(',', '')
+                    num_results = int(num_results)
+                    self.handle_num_results(num_results)
+                except (IndexError, ValueError):
+                    pass
 
     def _parse_article(self, div):
         self.article = ScholarArticle()
@@ -378,7 +487,6 @@ class ScholarArticleParser(object):
 
     @staticmethod
     def _tag_has_class(tag, klass):
-
         """
         This predicate function checks whether a BeatifulSoup Tag instance
         has a class attribute.
@@ -391,7 +499,7 @@ class ScholarArticleParser(object):
         return klass in res
 
     @staticmethod
-    def _tag_checker(tag):
+    def _tag_results_checker(tag):
         return tag.name == 'div' \
             and ScholarArticleParser._tag_has_class(tag, 'gs_r')
 
@@ -505,6 +613,14 @@ class ScholarArticleParser120726(ScholarArticleParser):
                 if tag.find('div', {'class': 'gs_fl'}):
                     self._parse_links(tag.find('div', {'class': 'gs_fl'}))
 
+                if tag.find('div', {'class': 'gs_rs'}):
+                    # These are the content excerpts rendered into the results.
+                    raw_text = tag.find('div', {'class': 'gs_rs'}).findAll(text=True)
+                    if len(raw_text) > 0:
+                        raw_text = ''.join(raw_text)
+                        raw_text = raw_text.replace('\n', '')
+                        self.article['excerpt'] = raw_text
+
 
 class ScholarQuery(object):
     """
@@ -512,11 +628,22 @@ class ScholarQuery(object):
     """
     def __init__(self):
         self.url = None
-        self.num_results = ScholarConf.MAX_PAGE_RESULTS
+
+        # The number of results requested from Scholar -- not the
+        # total number of results it reports (the latter gets stored
+        # in attrs, see below).
+        self.num_results = None
+
+        # Queries may have global result attributes, similar to
+        # per-article attributes in ScholarArticle. The exact set of
+        # attributes may differ by query type, but they all share the
+        # basic data structure:
+        self.attrs = {}
 
     def set_num_page_results(self, num_page_results):
-        msg = 'maximum number of results on page must be numeric'
-        self.num_results = ScholarUtils.ensure_int(num_page_results, msg)
+        self.num_results = ScholarUtils.ensure_int(
+            num_page_results,
+            'maximum number of results on page must be numeric')
 
     def set_start(self, start):
         msg = 'start offset must be numeric'
@@ -530,6 +657,53 @@ class ScholarQuery(object):
         """
         return None
 
+    def _add_attribute_type(self, key, label, default_value=None):
+        """
+        Adds a new type of attribute to the list of attributes
+        understood by this query. Meant to be used by the constructors
+        in derived classes.
+        """
+        if len(self.attrs) == 0:
+            self.attrs[key] = [default_value, label, 0]
+            return
+        idx = max([item[2] for item in self.attrs.values()]) + 1
+        self.attrs[key] = [default_value, label, idx]
+
+    def __getitem__(self, key):
+        """Getter for attribute value. Returns None if no such key."""
+        if key in self.attrs:
+            return self.attrs[key][0]
+        return None
+
+    def __setitem__(self, key, item):
+        """Setter for attribute value. Does nothing if no such key."""
+        if key in self.attrs:
+            self.attrs[key][0] = item
+
+    def _parenthesize_phrases(self, query):
+        """
+        Turns a query string containing comma-separated phrases into a
+        space-separated list of tokens, quoted if containing
+        whitespace. For example, input
+
+          'some words, foo, bar'
+
+        becomes
+
+          '"some words" foo bar'
+
+        This comes in handy during the composition of certain queries.
+        """
+        if query.find(',') < 0:
+            return query
+        phrases = []
+        for phrase in query.split(','):
+            phrase = phrase.strip()
+            if phrase.find(' ') > 0:
+                phrase = '"' + phrase + '"'
+            phrases.append(phrase)
+        return ' '.join(phrases)
+
 
 class ClusterScholarQuery(ScholarQuery):
     """
@@ -538,10 +712,11 @@ class ClusterScholarQuery(ScholarQuery):
     """
     SCHOLAR_CLUSTER_URL = ScholarConf.SCHOLAR_SITE + '/scholar?' \
         + 'cluster=%(cluster)s' \
-        + '&num=%(num)s'
+        + '%(num)s'
 
     def __init__(self, cluster=None):
         ScholarQuery.__init__(self)
+        self._add_attribute_type('num_results', 'Results', 0)
         self.cluster = None
         self.set_cluster(cluster)
 
@@ -556,11 +731,15 @@ class ClusterScholarQuery(ScholarQuery):
         if self.cluster is None:
             raise QueryArgumentError('cluster query needs cluster ID')
 
-        urlargs = {'cluster': self.cluster,
-                   'num': self.num_results or ScholarConf.MAX_PAGE_RESULTS}
+        urlargs = {'cluster': self.cluster }
 
         for key, val in urlargs.items():
-            urlargs[key] = quote(str(val))
+            urlargs[key] = quote(encode(val))
+
+        # The following URL arguments must not be quoted, or the
+        # server will not recognize them:
+        urlargs['num'] = ('&num=%d' % self.num_results
+                          if self.num_results is not None else '')
 
         return self.SCHOLAR_CLUSTER_URL % urlargs
 
@@ -613,18 +792,24 @@ class SearchScholarQuery(ScholarQuery):
         + '&as_publication=%(pub)s' \
         + '&as_ylo=%(ylo)s' \
         + '&as_yhi=%(yhi)s' \
-        + '&btnG=&hl=en&as_sdt=0,5&num=%(num)s'
+        + '&as_vis=%(citations)s' \
+        + '&btnG=&hl=en' \
+        + '%(num)s' \
+        + '&as_sdt=%(patents)s%%2C5'
 
     def __init__(self):
         ScholarQuery.__init__(self)
+        self._add_attribute_type('num_results', 'Results', 0)
         self.words = None # The default search behavior
         self.words_some = None # At least one of those words
         self.words_none = None # None of these words
         self.phrase = None
         self.scope_title = False # If True, search in title only
-        self.author = None 
+        self.author = None
         self.pub = None
         self.timeframe = [None, None]
+        self.include_patents = True
+        self.include_citations = True
 
     def set_words(self, words):
         """Sets words that *all* must be found in the result."""
@@ -668,6 +853,12 @@ class SearchScholarQuery(ScholarQuery):
             end = ScholarUtils.ensure_int(end)
         self.timeframe = [start, end]
 
+    def set_include_citations(self, yesorno):
+        self.include_citations = yesorno
+
+    def set_include_patents(self, yesorno):
+        self.include_patents = yesorno
+
     def get_url(self):
         if self.words is None and self.words_some is None \
            and self.words_none is None and self.phrase is None \
@@ -675,25 +866,43 @@ class SearchScholarQuery(ScholarQuery):
            and self.timeframe[0] is None and self.timeframe[1] is None:
             raise QueryArgumentError('search query needs more parameters')
 
+        # If we have some-words or none-words lists, we need to
+        # process them so GS understands them. For simple
+        # space-separeted word lists, there's nothing to do. For lists
+        # of phrases we have to ensure quotations around the phrases,
+        # separating them by whitespace.
+        words_some = None
+        words_none = None
+
+        if self.words_some:
+            words_some = self._parenthesize_phrases(self.words_some)
+        if self.words_none:
+            words_none = self._parenthesize_phrases(self.words_none)
+
         urlargs = {'words': self.words or '',
-                   'words_some': self.words_some or '',
-                   'words_none': self.words_none or '',
+                   'words_some': words_some or '',
+                   'words_none': words_none or '',
                    'phrase': self.phrase or '',
                    'scope': 'title' if self.scope_title else 'any',
                    'authors': self.author or '',
                    'pub': self.pub or '',
                    'ylo': self.timeframe[0] or '',
                    'yhi': self.timeframe[1] or '',
-                   'num': self.num_results or ScholarConf.MAX_PAGE_RESULTS}
+                   'patents': '0' if self.include_patents else '1',
+                   'citations': '0' if self.include_citations else '1'}
 
         for key, val in urlargs.items():
-            urlargs[key] = quote(str(val))
+            urlargs[key] = quote(encode(val))
+
+        # The following URL arguments must not be quoted, or the
+        # server will not recognize them:
+        urlargs['num'] = ('&num=%d' % self.num_results
+                          if self.num_results is not None else '')
 
         return self.SCHOLAR_QUERY_URL % urlargs
 
 
 class ScholarSettings(object):
-
     """
     This class lets you adjust the Scholar settings for your
     session. It's intended to mirror the features tunable in the
@@ -707,22 +916,22 @@ class ScholarSettings(object):
 
     def __init__(self):
         self.citform = 0 # Citation format, default none
-        self.per_page_results = ScholarConf.MAX_PAGE_RESULTS
+        self.per_page_results = None
         self._is_configured = False
 
     def set_citation_format(self, citform):
         citform = ScholarUtils.ensure_int(citform)
         if citform < 0 or citform > self.CITFORM_BIBTEX:
-            raise FormatError('citation format invalid, is "%s"' \
+            raise FormatError('citation format invalid, is "%s"'
                               % citform)
         self.citform = citform
         self._is_configured = True
 
     def set_per_page_results(self, per_page_results):
-        msg = 'page results must be integer'
-        self.per_page_results = ScholarUtils.ensure_int(per_page_results, msg)
-        self.per_page_results = min(self.per_page_results,
-                                    ScholarConf.MAX_PAGE_RESULTS)
+        self.per_page_results = ScholarUtils.ensure_int(
+            per_page_results, 'page results must be integer')
+        self.per_page_results = min(
+            self.per_page_results, ScholarConf.MAX_PAGE_RESULTS)
         self._is_configured = True
 
     def is_configured(self):
@@ -730,7 +939,6 @@ class ScholarSettings(object):
 
 
 class ScholarQuerier(object):
-
     """
     ScholarQuerier instances can conduct a search on Google Scholar
     with subsequent parsing of the resulting HTML content.  The
@@ -760,6 +968,10 @@ class ScholarQuerier(object):
         def __init__(self, querier):
             ScholarArticleParser120726.__init__(self)
             self.querier = querier
+
+        def handle_num_results(self, num_results):
+            if self.querier is not None and self.querier.query is not None:
+                self.querier.query['num_results'] = num_results
 
         def handle_article(self, art):
             self.querier.add_article(art)
@@ -805,7 +1017,7 @@ class ScholarQuerier(object):
         # Now parse the required stuff out of the form. We require the
         # "scisig" token to make the upload of our settings acceptable
         # to Google.
-        soup = BeautifulSoup(html)
+        soup = SoupKitchen.make_soup(html)
 
         tag = soup.find(name='form', attrs={'id': 'gs_settings_form'})
         if tag is None:
@@ -912,7 +1124,7 @@ class ScholarQuerier(object):
         if err_msg is None:
             err_msg = 'request failed'
         try:
-            ScholarUtils.log('info', 'requesting %s' % url)
+            ScholarUtils.log('info', 'requesting %s' % unquote(url))
 
             req = Request(url=url, headers={'User-Agent': ScholarConf.USER_AGENT})
             hdl = self.opener.open(req)
@@ -923,7 +1135,7 @@ class ScholarQuerier(object):
             ScholarUtils.log('debug', 'url: %s' % hdl.geturl())
             ScholarUtils.log('debug', 'result: %s' % hdl.getcode())
             ScholarUtils.log('debug', 'headers:\n' + str(hdl.info()))
-            ScholarUtils.log('debug', 'data:\n' + html)
+            ScholarUtils.log('debug', 'data:\n' + html.decode('utf-8')) # For Python 3
             ScholarUtils.log('debug', '<<<<' + '-'*68)
 
             return html
@@ -932,7 +1144,27 @@ class ScholarQuerier(object):
             return None
 
 
-def txt(querier):
+def txt(querier, with_globals):
+    if with_globals:
+        # If we have any articles, check their attribute labels to get
+        # the maximum length -- makes for nicer alignment.
+        max_label_len = 0
+        if len(querier.articles) > 0:
+            items = sorted(list(querier.articles[0].attrs.values()),
+                           key=lambda item: item[2])
+            max_label_len = max([len(str(item[1])) for item in items])
+
+        # Get items sorted in specified order:
+        items = sorted(list(querier.query.attrs.values()), key=lambda item: item[2])
+        # Find largest label length:
+        max_label_len = max([len(str(item[1])) for item in items] + [max_label_len])
+        fmt = '[G] %%%ds %%s' % max(0, max_label_len-4)
+        for item in items:
+            if item[0] is not None:
+                print(fmt % (item[1], item[0]))
+        if len(items) > 0:
+            print
+
     articles = querier.articles
     for art in articles:
         print(encode(art.as_txt()) + '\n')
@@ -975,9 +1207,9 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
     group.add_option('-A', '--all', metavar='WORDS', default=None, dest='allw',
                      help='Results must contain all of these words')
     group.add_option('-s', '--some', metavar='WORDS', default=None,
-                     help='Results must contain at least one of these words')
+                     help='Results must contain at least one of these words. Pass arguments in form -s "foo bar baz" for simple words, and -s "a phrase, another phrase" for phrases')
     group.add_option('-n', '--none', metavar='WORDS', default=None,
-                     help='Results must contain none of these words')
+                     help='Results must contain none of these words. See -s|--some re. formatting')
     group.add_option('-p', '--phrase', metavar='PHRASE', default=None,
                      help='Results must contain exact phrase')
     group.add_option('-t', '--title-only', action='store_true', default=False,
@@ -988,6 +1220,10 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
                      help='Results must have appeared in or after given year')
     group.add_option('--before', metavar='YEAR', default=None,
                      help='Results must have appeared in or before given year')
+    group.add_option('--no-patents', action='store_true', default=False,
+                     help='Do not include patents in results')
+    group.add_option('--no-citations', action='store_true', default=False,
+                     help='Do not include citations in results')
     group.add_option('-C', '--cluster-id', metavar='CLUSTER_ID', default=None,
                      help='Do not search, just use articles in given cluster ID')
     group.add_option('-c', '--count', type='int', default=None,
@@ -1001,6 +1237,8 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
                                  'These options control the appearance of the results.')
     group.add_option('--txt', action='store_true',
                      help='Print article data in text format (default)')
+    group.add_option('--txt-globals', action='store_true',
+                     help='Like --txt, but first print global results too')
     group.add_option('--csv', action='store_true',
                      help='Print article data in CSV form (separator is "|")')
     group.add_option('--csv-header', action='store_true',
@@ -1031,7 +1269,7 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
         ScholarUtils.log('info', 'using log level %d' % ScholarConf.LOG_LEVEL)
 
     if options.version:
-        print 'This is scholar.py %s.' % ScholarConf.VERSION
+        print('This is scholar.py %s.' % ScholarConf.VERSION)
         return 0
 
     if options.cookie_file:
@@ -1043,7 +1281,7 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
         if options.author or options.allw or options.some or options.none \
            or options.phrase or options.title_only or options.pub \
            or options.after or options.before:
-            print 'Cluster ID queries do not allow additional search arguments.'
+            print('Cluster ID queries do not allow additional search arguments.')
             return 1
 
     querier = ScholarQuerier()
@@ -1058,7 +1296,7 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
     elif options.citation == 'rw':
         settings.set_citation_format(ScholarSettings.CITFORM_REFWORKS)
     elif options.citation is not None:
-        print 'Invalid citation link format, must be one of "bt", "en", "rm", or "rw".'
+        print('Invalid citation link format, must be one of "bt", "en", "rm", or "rw".')
         return 1
 
     querier.apply_settings(settings)
@@ -1086,6 +1324,10 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
             query.set_pub(options.pub)
         if options.after or options.before:
             query.set_timeframe(options.after, options.before)
+        if options.no_patents:
+            query.set_include_patents(False)
+        if options.no_citations:
+            query.set_include_citations(False)
 
     if options.count is not None:
         options.count = min(options.count, ScholarConf.MAX_PAGE_RESULTS)
@@ -1103,7 +1345,7 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
     elif options.citation is not None:
         citation_export(querier)
     else:
-        txt(querier)
+        txt(querier, with_globals=options.txt_globals)
 
     if options.cookie_file:
         querier.save_cookies()
